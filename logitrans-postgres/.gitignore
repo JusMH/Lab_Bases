@@ -1,0 +1,4 @@
+.env
+.secrets/
+evidencias/*
+!evidencias/.gitkeep

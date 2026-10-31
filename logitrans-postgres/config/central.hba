@@ -1,0 +1,4 @@
+local all postgres peer
+host replication repl_fisica 172.30.84.3/32 scram-sha-256
+host all all 0.0.0.0/0 reject
+host all all ::0/0 reject

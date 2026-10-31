@@ -1,0 +1,4 @@
+local all postgres peer
+host logitrans repl_logica 172.30.84.4/32 scram-sha-256
+host all all 0.0.0.0/0 reject
+host all all ::0/0 reject

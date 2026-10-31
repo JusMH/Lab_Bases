@@ -1,0 +1,64 @@
+name: logitrans_lab
+x-common: &common
+  image: ${PG_IMAGE:-postgres:18-bookworm}
+  restart: unless-stopped
+  environment:
+    POSTGRES_DB: logitrans
+    POSTGRES_PASSWORD_FILE: /run/secrets/admin
+    POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=peer
+    PGDATA: /var/lib/postgresql/18/docker
+  secrets: [admin, physical, logical]
+  healthcheck:
+    test: [CMD-SHELL, 'gosu postgres pg_isready -U postgres -d logitrans']
+    interval: 2s
+    timeout: 3s
+    retries: 60
+  stop_grace_period: 60s
+services:
+  central-db:
+    <<: *common
+    ports: ['127.0.0.1:${CENTRAL_PORT:-15432}:5432']
+    command: [postgres, -c, config_file=/etc/lab/postgresql.conf, -c, hba_file=/etc/lab/central.hba]
+    volumes:
+      - central-data:/var/lib/postgresql
+      - ./config:/etc/lab:ro
+      - ./scripts/init-central.sh:/docker-entrypoint-initdb.d/10-central.sh:ro
+      - ./sql:/lab/sql:ro
+    networks:
+      lab: {ipv4_address: 172.30.84.2}
+  regional-db:
+    <<: *common
+    ports: ['127.0.0.1:${REGIONAL_PORT:-5433}:5432']
+    entrypoint: [bash, /lab/standby.sh]
+    command: [postgres, -c, config_file=/etc/lab/postgresql.conf, -c, hba_file=/etc/lab/regional.hba, -c, hot_standby_feedback=on]
+    depends_on:
+      central-db: {condition: service_healthy}
+    volumes:
+      - regional-data:/var/lib/postgresql
+      - ./config:/etc/lab:ro
+      - ./scripts/standby.sh:/lab/standby.sh:ro
+    networks:
+      lab: {ipv4_address: 172.30.84.3}
+  bi-db:
+    <<: *common
+    ports: ['127.0.0.1:${BI_PORT:-5434}:5432']
+    command: [postgres, -c, config_file=/etc/lab/postgresql.conf, -c, hba_file=/etc/lab/bi.hba]
+    volumes:
+      - bi-data:/var/lib/postgresql
+      - ./config:/etc/lab:ro
+      - ./sql/bi.sql:/docker-entrypoint-initdb.d/10-bi.sql:ro
+      - ./scripts/subscribe.sh:/lab/subscribe.sh:ro
+    networks:
+      lab: {ipv4_address: 172.30.84.4}
+networks:
+  lab:
+    ipam:
+      config: [{subnet: '${LAB_SUBNET:-172.30.84.0/24}'}]
+volumes:
+  central-data:
+  regional-data:
+  bi-data:
+secrets:
+  admin: {file: ./.secrets/admin}
+  physical: {file: ./.secrets/physical}
+  logical: {file: ./.secrets/logical}

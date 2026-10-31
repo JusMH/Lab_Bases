@@ -1,0 +1,3 @@
+local all postgres peer
+host all all 0.0.0.0/0 reject
+host all all ::0/0 reject
