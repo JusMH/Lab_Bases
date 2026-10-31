@@ -1,28 +1,104 @@
-# Laboratorio PostgreSQL — LogiTrans S.A.
+# Laboratorio PostgreSQL LogiTrans S.A.
 
-Laboratorio aislado de tres instancias PostgreSQL 18.6, ejecutado y verificado, con volúmenes independientes. El resumen de la ejecución está en `RESULTADOS.md`:
+## Descripción y objetivo
+
+Este laboratorio implementa una arquitectura de tres nodos PostgreSQL 18.6 para estudiar la combinación de replicación física y lógica. El objetivo es mantener una réplica completa del clúster operativo y distribuir exclusivamente los datos de empleados a una instancia de análisis, mediante una suscripción cuyo origen es el standby físico.
+
+La solución utiliza Docker Compose, PowerShell, Bash y SQL. Los resultados de las pruebas se presentan en [RESULTADOS.md](RESULTADOS.md), y la relación de registros y capturas disponibles se encuentra en [EVIDENCIAS.md](EVIDENCIAS.md).
+
+## Arquitectura
 
 ```text
-central-db (172.30.84.2:5432)  -- física --> regional-db (172.30.84.3:5432)
-                                                  |
-                                             lógica pgoutput
-                                                  v
-                                         bi-db (172.30.84.4:5432)
+central-db -- replicación física --> regional-db -- replicación lógica --> bi-db
 ```
 
-| Servicio | Puerto Windows, solo loopback | Función y datos |
-|---|---|---|
-| central-db | 15432 | Primario; empleados y entregas |
-| regional-db | 5433 | Standby físico de solo lectura; ambas tablas; emisor lógico |
-| bi-db | 5434 | Suscriptor; solamente empleados |
+| Nodo | Función | Puerto del host Windows | Puerto interno | Dirección en Docker | Tablas de logitrans |
+|---|---|---|---|---|---|
+| central-db | Primario | 15432 | 5432 | 172.30.84.2 | empleados y entregas |
+| regional-db | Standby físico y emisor lógico | 5433 | 5432 | 172.30.84.3 | empleados y entregas |
+| bi-db | Suscriptor lógico de BI | 5434 | 5432 | 172.30.84.4 | empleados |
 
-**Diferencia necesaria:** 5432 ya estaba ocupado por un proceso PostgreSQL de Windows (PID 7852 durante la inspección). No se detuvo ni modificó. Se utiliza 15432 para el primario. Los puertos internos siguen siendo 5432. Los puertos publicados están reservados al laboratorio, pero HBA rechaza las conexiones TCP administrativas: la administración autorizada se hace con `docker compose exec -u postgres`, mediante socket Unix y autenticación peer.
+Los servicios pertenecen a la red `172.30.84.0/24` y tienen volúmenes independientes. El puerto 5432 del host estaba ocupado por una instalación PostgreSQL existente, según [entorno.txt](evidencias/entorno.txt); por ello, el primario se publica en 15432. Esta asignación afecta únicamente al acceso desde Windows: las conexiones entre contenedores usan los nombres de servicio y el puerto interno 5432.
 
-## Requisitos y puesta en marcha
+Los puertos se publican en `127.0.0.1`. Las reglas HBA rechazan las conexiones TCP administrativas; las consultas de administración se ejecutan dentro de cada contenedor, como usuario del sistema `postgres`, mediante socket Unix y autenticación `peer`.
 
-Windows con PowerShell 5.1 o posterior, Docker Desktop con motor Linux y Compose v2 o posterior. Acceso a Docker Hub para descargar la imagen. No requiere instalar psql, Python ni PostgreSQL en Windows. Reservar al menos 2 GB de memoria y espacio para tres clústeres y WAL. Entorno comprobado: Docker Engine 29.7.2, Compose v5.3.1. La imagen se fija mediante digest en `.env.example`, para que todos los nodos utilicen exactamente el mismo contenido.
+## Modelo de datos
 
-Desde PowerShell:
+La base `logitrans` contiene las siguientes tablas en central-db y regional-db:
+
+```sql
+CREATE TABLE empleados (
+    id_empleado SERIAL PRIMARY KEY,
+    nombre TEXT NOT NULL,
+    departamento TEXT,
+    salario NUMERIC
+);
+
+CREATE TABLE entregas (
+    id_entrega SERIAL PRIMARY KEY,
+    fecha DATE,
+    destino TEXT,
+    id_empleado INT REFERENCES empleados(id_empleado)
+);
+```
+
+[sql/central.sql](sql/central.sql) inicializa cuatro empleados y tres entregas. En BI, [sql/bi.sql](sql/bi.sql) crea únicamente `empleados`, con la misma estructura. La clave primaria proporciona la identidad de réplica necesaria para UPDATE y DELETE.
+
+## Replicación física
+
+El primario utiliza `wal_level=logical`, `max_wal_senders=10` y `max_replication_slots=10`. El nivel lógico de WAL es necesario para la decodificación posterior en el standby. La configuración compartida se encuentra en [config/postgresql.conf](config/postgresql.conf).
+
+El rol `repl_fisica` tiene los atributos LOGIN y REPLICATION. [config/central.hba](config/central.hba) autoriza el protocolo de replicación física únicamente desde `172.30.84.3/32`, con SCRAM-SHA-256. El slot físico `regional_physical` se crea en central-db con reserva inicial de WAL.
+
+[scripts/standby.sh](scripts/standby.sh) inicializa regional-db mediante el siguiente comando, dentro del contenedor:
+
+```sh
+pg_basebackup \
+  --dbname='host=central-db user=repl_fisica application_name=regional-db passfile=/var/lib/postgresql/physical.pgpass' \
+  -D "$PGDATA" -R -X stream -S regional_physical --checkpoint=fast --no-password
+```
+
+La opción `-R` genera `standby.signal` y añade `primary_conninfo` y `primary_slot_name` a `postgresql.auto.conf`. La contraseña se obtiene de un archivo de autenticación con permisos 0600. El directorio de datos es `/var/lib/postgresql/18/docker`, dentro del volumen montado en `/var/lib/postgresql`.
+
+La copia base se realiza únicamente sobre un directorio vacío sin `PG_VERSION`. Un directorio parcialmente inicializado requiere revisión manual. En los arranques siguientes se reutiliza el volumen y se exige la presencia de `standby.signal`, manteniendo la función de standby.
+
+## Replicación lógica desde el standby
+
+La publicación `pub_empleados` se define en **central-db** mediante `CREATE PUBLICATION pub_empleados FOR TABLE public.empleados`. La replicación física lleva su definición y los datos hasta regional-db. Esta ubicación del DDL responde al carácter de solo lectura del standby; regional-db es el servidor que decodifica y transmite los cambios al suscriptor.
+
+[scripts/subscribe.sh](scripts/subscribe.sh) crea en bi-db la suscripción `sub_empleados`, con `host=regional-db port=5432 dbname=logitrans user=repl_logica`, `copy_data=true`, slot `bi_empleados` y `failover=false`. La copia inicial incluye los registros existentes. Los cambios posteriores de `empleados` se transmiten mediante `pgoutput`; `entregas` queda fuera de la publicación y del esquema de BI.
+
+En PostgreSQL 18 es posible crear un slot lógico local en un standby. Regional-db utiliza `hot_standby_feedback=on` y el slot físico del enlace ascendente para proteger los catálogos necesarios para decodificar. Si el primario está inactivo, la creación del slot puede esperar información sobre las transacciones; el controlador emite `pg_log_standby_snapshot()` en central-db durante la creación y sincronización inicial. Estas condiciones se describen en la [documentación de decodificación lógica](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html).
+
+`sync_replication_slots` no se habilita: sincroniza slots de failover procedentes del primario y no es necesario para el slot local de este laboratorio. Los slots con `synced=true` no pueden utilizarse para decodificación mientras el nodo está en recuperación, según la [vista pg_replication_slots](https://www.postgresql.org/docs/18/view-pg-replication-slots.html).
+
+El origen efectivo se verifica relacionando el slot activo de regional-db con `pg_stat_replication`, la dirección de BI `172.30.84.4` y la aplicación `bi-empleados`. También se comprueba la conexión de la suscripción y la ausencia de slots lógicos en central-db.
+
+## Configuración y seguridad
+
+| Componente | Configuración |
+|---|---|
+| Rol físico | repl_fisica: LOGIN y REPLICATION; acceso físico desde regional-db |
+| Rol lógico | repl_logica: LOGIN y REPLICATION; CONNECT a logitrans, USAGE en public y SELECT sobre empleados |
+| Privilegios restringidos | Ambos roles sin SUPERUSER, CREATEDB, CREATEROLE ni BYPASSRLS; repl_logica sin permisos DML ni SELECT sobre entregas |
+| Acceso lógico | [config/regional.hba](config/regional.hba): logitrans, repl_logica, origen 172.30.84.4/32 y SCRAM-SHA-256 |
+| Administración | Usuario postgres local con peer; propietario de la suscripción en BI |
+| Acceso restante | Rechazo TCP en los tres nodos; sin reglas trust ni MD5 |
+| Privilegios de PUBLIC | Se revocan CONNECT y TEMPORARY sobre logitrans y CREATE sobre public |
+
+El arranque genera tres credenciales aleatorias independientes de 256 bits en `.secrets/`, si no existen, y restringe la ACL de Windows al usuario actual y SYSTEM. Docker las monta como archivos. `.env` y `.secrets/` están excluidos de Git; deben conservarse con los volúmenes, ya que regenerar archivos de credenciales no cambia las contraseñas de un clúster inicializado.
+
+La contraseña de la conexión lógica se almacena en el catálogo de suscripciones. Las consultas documentadas muestran solo el tramo del conninfo anterior a `password`, conforme al formato construido por el script, y omiten los verificadores de contraseña.
+
+## Requisitos
+
+Se requiere Windows con PowerShell 5.1 o posterior, Docker Desktop con motor Linux, Docker Compose con soporte para `up --wait --wait-timeout` y acceso a Docker Hub. `psql` se ejecuta en los contenedores; no es necesario instalar PostgreSQL, Python ni paquetes adicionales en Windows. Las versiones utilizadas constan en [entorno.txt](evidencias/entorno.txt).
+
+La máquina debe disponer de memoria y almacenamiento para tres clústeres y sus registros WAL. Antes del primer arranque, los puertos 15432, 5433 y 5434 deben estar libres, el nombre de proyecto `logitrans_lab` debe estar disponible y la red `172.30.84.0/24` no debe solaparse con otras redes de Docker o del host. Las IP estáticas, las reglas HBA y las verificaciones están coordinadas; cambiar únicamente `LAB_SUBNET` no constituye una adaptación válida de la red.
+
+## Instalación y ejecución
+
+Los siguientes comandos se ejecutan desde PowerShell. La ruta corresponde a la ubicación del proyecto en el entorno documentado; en otra máquina debe sustituirse por la carpeta de la copia local.
 
 ```powershell
 Set-Location C:\Users\Justin\Desktop\Lab_Bases\logitrans-postgres
@@ -33,123 +109,86 @@ docker network ls
 powershell -NoProfile -ExecutionPolicy Bypass -File .\lab.ps1 Start
 ```
 
-`Start` genera `.env` y tres contraseñas aleatorias de 256 bits en `.secrets/` si no existen, limita la ACL local al usuario actual y SYSTEM, levanta los servicios, espera disponibilidad, configura la suscripción si no existe y ejecuta **todas las pruebas, incluido el reinicio**. `.env` no contiene contraseñas. Docker monta los secretos como archivos; no se publican en el repositorio. Conservarlos junto con los volúmenes: regenerarlos no cambia las contraseñas guardadas dentro de clústeres existentes. No compartir `.secrets/`, dumps de catálogos sensibles ni `docker inspect` sin revisar.
+`Start` copia [.env.example](.env.example) si falta `.env`, prepara las credenciales, levanta los servicios y espera su disponibilidad. El archivo de ejemplo fija la imagen por digest. La suscripción solo se crea si no existe. A continuación se ejecuta la batería completa, **incluido el reinicio de los tres contenedores**.
 
-Antes del primer arranque en otra máquina, comprobar que no exista un proyecto Compose llamado `logitrans_lab` y que `172.30.84.0/24` no se solape con otra red, VPN o ruta. Si existe un conflicto, cambiar `COMPOSE_PROJECT_NAME` en `.env`. Para cambiar la red hay que actualizar **juntos** el subnet en `.env`, las tres IP estáticas de `compose.yaml` y las IP de HBA y las comprobaciones en `lab.ps1`. No cambiar solo `LAB_SUBNET`. Para puertos ocupados basta cambiar `CENTRAL_PORT`, `REGIONAL_PORT` o `BI_PORT`; no cambiar los puertos del conninfo entre servicios.
+Los scripts SQL de inicialización se aplican únicamente al crear volúmenes vacíos. Los arranques ordinarios reutilizan los datos y no duplican las semillas. Las comprobaciones asíncronas utilizan sondeo de 500 ms, plazos de 90 segundos por defecto y consultas con `statement_timeout=15000`. La creación de la suscripción y la espera de sincronización inicial tienen límites de 120 segundos por fase; Compose dispone de un límite de disponibilidad de 180 segundos.
 
-## Inicialización física
+| Acción de lab.ps1 | Comportamiento |
+|---|---|
+| Start | Preparar, iniciar y ejecutar todas las pruebas |
+| Test | Ejecutar las pruebas sobre los servicios existentes; incluye escrituras de prueba y reinicio |
+| Status | Consultar los contenedores y exportar estados y logs |
+| Restart | Reiniciar los contenedores y esperar disponibilidad |
+| Stop | Detener los servicios conservando los volúmenes |
 
-`sql/central.sql` se ejecuta únicamente durante la inicialización de un volumen vacío del primario. Crea el modelo solicitado, cuatro empleados y tres entregas, roles y publicación. La tabla tiene su PK como identidad de réplica para UPDATE/DELETE. El rol `repl_fisica` tiene LOGIN y REPLICATION, sin SUPERUSER, CREATEDB, CREATEROLE ni BYPASSRLS.
-
-`config/postgresql.conf` establece `wal_level=logical`, diez WAL senders y diez slots en todos los nodos. El primario permite por TCP únicamente el protocolo de replicación física desde la IP del standby y con SCRAM-SHA-256.
-
-El primario crea `regional_physical`, con reserva inicial de WAL. `scripts/standby.sh` genera un passfile con modo 0600 y usa:
-
-```sh
-pg_basebackup --dbname='host=central-db user=repl_fisica application_name=regional-db passfile=/var/lib/postgresql/physical.pgpass' \
-  -D "$PGDATA" -R -X stream -S regional_physical --checkpoint=fast --no-password
-```
-
-`-R` genera `standby.signal` y `primary_conninfo`/`primary_slot_name` en `postgresql.auto.conf`. El passfile evita incluir contraseñas en conninfo. El standby utiliza HBA propio y `hot_standby_feedback=on`. Solo se clona si no existe PG_VERSION y el directorio está vacío. Ante una copia incompleta el script se detiene para revisión; no borra datos. Si desaparece `standby.signal`, rechaza el arranque para evitar un nodo escribible accidental. PGDATA está en `/var/lib/postgresql/18/docker`, dentro del volumen montado en `/var/lib/postgresql`, conforme a la organización de la imagen PostgreSQL 18.
-
-## Replicación lógica desde regional-db
-
-La publicación `pub_empleados FOR TABLE public.empleados` se crea en **central-db**. Sus catálogos y tablas llegan al standby mediante replicación física. Nunca se crean tablas, bases ni publicaciones escribiendo en regional-db.
-
-En BI se crea localmente solo la tabla `empleados`. `scripts/subscribe.sh`, ejecutado como postgres, crea `sub_empleados` con `host=regional-db port=5432 dbname=logitrans user=repl_logica`, publicación `pub_empleados`, `copy_data=true` y slot `bi_empleados`. El secreto se introduce por stdin, sin imprimir el conninfo. PostgreSQL almacena ese secreto en su catálogo de suscripciones, accesible al administrador; no debe volcarse dicho catálogo completo en evidencias. El propietario de la suscripción es postgres local; el usuario remoto tiene privilegios mínimos para leer la tabla publicada.
-
-El slot lógico **se crea y se consume en el standby** usando `pgoutput`; no hay slot lógico en central-db. La conexión real se comprueba mediante el PID del slot unido a `pg_stat_replication`, cliente `172.30.84.4` y aplicación `bi-empleados`, además del conninfo de la suscripción. No basta con verificar el nombre DNS en un archivo.
-
-Durante la creación y la copia inicial, el controlador emite `pg_log_standby_snapshot()` en el primario hasta completar cada fase, con límite de 120 segundos. Esto resuelve la espera de metadatos de transacciones cuando el primario está inactivo. El resto de comprobaciones tiene plazos de 90 segundos, consultas limitadas a 15 segundos y sondeo de 500 ms; una espera no se interpreta como éxito.
-
-No se activa `sync_replication_slots`: esa opción copia slots de failover del primario al standby y **no es necesaria para un slot local decodificando en un standby**. Los slots sincronizados con `synced=true` no pueden utilizarse para decodificar mientras el servidor sigue en recuperación. Este laboratorio no incluye promoción, failover automático ni cambio de origen.
-
-La replicación lógica no replica DDL, secuencias ni la tabla entregas. Por eso BI tiene su esquema propio y no se usa para insertar empleados; su secuencia SERIAL no se sincroniza. Una modificación futura de esquema debe aplicarse de manera coordinada. La réplica física sí reproduce todo el clúster, incluidos roles y catálogos.
-
-## Seguridad y límites del entorno
-
-* `repl_logica`: LOGIN y REPLICATION; CONNECT a logitrans, USAGE en public y SELECT exclusivamente sobre empleados. Sin SELECT sobre entregas ni permisos DML. PUBLIC no tiene CREATE sobre public ni CONNECT/TEMP sobre logitrans.
-* `repl_fisica`: protocolo físico solo desde la IP del standby; no se le concede acceso ordinario a logitrans.
-* HBA permite peer para el administrador postgres por socket; SCRAM para cada conexión de replicación autorizada y rechaza el resto del TCP. No hay trust ni MD5.
-* Contraseñas diferentes para administrador, réplica física y réplica lógica. `.secrets/` y `.env` están ignorados por Git. Los scripts ordinarios no borran volúmenes ni datos preexistentes.
-* Red de laboratorio Docker y puertos publicados exclusivamente en 127.0.0.1. SCRAM autentica, pero no cifra el WAL: no hay TLS. Para uso entre hosts se necesitarían TLS y reglas de infraestructura adicionales. Este laboratorio no es un despliegue de producción.
-* `max_slot_wal_keep_size=1GB` limita retención por slots. Una interrupción suficientemente larga puede invalidar un slot; revisar `invalidation_reason`, almacenamiento y retrasos. `hot_standby_feedback` puede aumentar bloat en el primario. No hay garantía de cero pérdida frente a una caída del primario: las réplicas son asíncronas.
-
-## Pruebas y resultados
+Para repetir las pruebas y consultar su reporte:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\lab.ps1 Test
-powershell -NoProfile -ExecutionPolicy Bypass -File .\lab.ps1 Status
-Get-ChildItem .\evidencias\tests-*.txt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
+Get-ChildItem .\evidencias\tests-*.txt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Encoding UTF8
 ```
 
-Cada prueba muestra PASS o FAIL, conserva los fallos y devuelve error si alguna comprobación falla. Los archivos `tests-*.txt` registran la ejecución real. No interpretar la existencia de archivos SQL como una prueba aprobada.
+## Consultas de verificación
 
-| Prueba | Validación |
-|---|---|
-| A | Tres nodos disponibles con la misma versión 18.x |
-| B | Primario fuera de recuperación, regional en recuperación |
-| C | Sender físico streaming y receptor WAL con slot y origen correctos |
-| D | Copia inicial con valores exactos; INSERT con marcador UUID e ID retornado |
-| E | Cambio exacto de departamento y salario en ambos destinos |
-| F | DELETE del ID probado, después del reinicio, en los tres nodos |
-| G | Entrega con ID, fecha, destino y empleado exactos en regional |
-| H | Ausencia comprobada de public.entregas en BI |
-| I | Única tabla publicada; conninfo, slot local y conexión real regional → BI |
-| J | Roles, privilegios mínimos, hashes SCRAM sin mostrarlos, HBA y parámetros |
-| K | transaction_read_only=on y CREATE TABLE realmente rechazado |
-| L | Reinicio de los tres contenedores, persistencia de datos y UPDATE nuevo replicado |
-| FINAL | Apply worker activo, contadores de errores en cero y enlace físico restaurado |
-
-G se ejecuta antes de F para respetar la FK. Los empleados y entregas temporales se identifican con UUID y se eliminan por ID y marcador, nunca por conteos globales. Solo las secuencias aumentan entre ejecuciones. En un fallo parcial puede quedar un registro TEST_; revisarlo por ID antes de retirarlo. El script no vacía tablas ni reinicializa volúmenes para hacer pasar una prueba.
-
-## Consultas de administración
+Estas consultas son de lectura y permiten revisar disponibilidad, flujo de WAL, publicación, suscripción y separación de tablas:
 
 ```powershell
 docker compose ps
-docker compose exec -T -u postgres central-db psql -d logitrans -c "SELECT application_name,client_addr,state,flush_lsn,replay_lsn FROM pg_stat_replication;"
+docker compose exec -T -u postgres central-db psql -d logitrans -c "SELECT pg_is_in_recovery(); SELECT application_name,client_addr,state,flush_lsn,replay_lsn FROM pg_stat_replication;"
 docker compose exec -T -u postgres regional-db psql -d logitrans -c "SELECT pg_is_in_recovery(); SELECT status,sender_host,slot_name,flushed_lsn FROM pg_stat_wal_receiver;"
-docker compose exec -T -u postgres regional-db psql -d logitrans -c "SELECT slot_name,slot_type,plugin,active,synced,invalidation_reason FROM pg_replication_slots; SELECT application_name,client_addr,state FROM pg_stat_replication;"
-docker compose exec -T -u postgres regional-db psql -d logitrans -c "SELECT * FROM pg_publication_tables;"
-docker compose exec -T -u postgres bi-db psql -d logitrans -c "SELECT subname,subenabled,subslotname,subpublications,split_part(subconninfo,' password=',1) AS safe_endpoint FROM pg_subscription; SELECT * FROM pg_stat_subscription_stats;"
-docker compose exec -T -u postgres bi-db psql -d logitrans -c "SELECT * FROM empleados ORDER BY id_empleado; SELECT to_regclass('public.entregas');"
+docker compose exec -T -u postgres regional-db psql -d logitrans -c "SELECT * FROM pg_publication_tables; SELECT slot_name,slot_type,plugin,active,synced,invalidation_reason FROM pg_replication_slots; SELECT application_name,client_addr,state FROM pg_stat_replication;"
+docker compose exec -T -u postgres bi-db psql -d logitrans -c "SELECT subname,subenabled,subslotname,subpublications,split_part(subconninfo,' password=',1) AS origen FROM pg_subscription; SELECT subname,apply_error_count,sync_error_count FROM pg_stat_subscription_stats;"
+docker compose exec -T -u postgres bi-db psql -d logitrans -c "TABLE empleados; SELECT to_regclass('public.entregas') IS NULL AS entregas_ausente;"
 docker compose logs --tail 80 central-db regional-db bi-db
 ```
 
-El recorte de conninfo es seguro para el formato construido por este laboratorio (password aparece después de user). Si se cambia su formato, revisar también la exportación de evidencias. No usar `SELECT * FROM pg_subscription` ni consultar `pg_authid.rolpassword` al compartir resultados.
+## Resultados generales
 
-## Reiniciar y detener conservando datos
+Las ejecuciones conservadas del 30 de octubre de 2026 a las 18:05 y 18:06 aprobaron las pruebas A–L y la comprobación final. La última concluyó a las 18:07:00, hora de Costa Rica, con `failures=0`. Verificó INSERT, UPDATE y DELETE mediante un identificador y un marcador únicos, la separación de tablas y la continuidad de la replicación después del reinicio. El detalle se encuentra en [RESULTADOS.md](RESULTADOS.md) y en el [reporte final de pruebas](evidencias/tests-20261030-180630.txt).
+
+Cada comprobación registra PASS o FAIL; la batería devuelve error si falla alguna. El intento inicial y sus cinco fallos se conservan como antecedente de una incidencia del verificador, descrita en el informe de resultados. Las evidencias representan el estado observado durante esas ejecuciones.
+
+## Reinicio y parada
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\lab.ps1 Restart
-powershell -NoProfile -ExecutionPolicy Bypass -File .\lab.ps1 Test
 powershell -NoProfile -ExecutionPolicy Bypass -File .\lab.ps1 Stop
-# Reanudar y validar:
+# Reanudar y validar el laboratorio:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\lab.ps1 Start
 ```
 
-También se puede usar `docker compose stop` y `docker compose up -d --wait`. `docker compose down` retira contenedores/red pero conserva volúmenes; no usar `down -v`, `volume prune` ni borrar `.secrets/` para una operación ordinaria. El proyecto no realiza esas operaciones. Nunca promover regional-db para resolver un fallo de arranque: cambiaría la topología requerida.
+`Restart` y `Stop` conservan los volúmenes. `docker compose down` también conserva los volúmenes nombrados si se ejecuta sin `-v`; la opción `-v` elimina esos datos. Las credenciales existentes deben mantenerse para los arranques siguientes. Durante un reinicio pueden aparecer cierres administrativos y rechazos transitorios de conexión hasta que el emisor esté disponible.
 
-## Problemas encontrados y soluciones
+## Limitaciones técnicas
 
-1. Puerto 5432 ocupado por una instalación ajena: asignado 15432 solo al primario del laboratorio.
-2. PowerShell 5.1 interpreta mensajes normales de progreso de Docker en stderr como errores: el envoltorio recoge ambos canales y decide por código de salida.
-3. Lectura de ExitCode con Start-Process no fue fiable en el controlador inicial: se cambió a System.Diagnostics.Process y WaitForExit; la suscripción se había creado correctamente y no se duplicó.
-4. Healthcheck iniciado como root chocaba con peer: se ejecuta `gosu postgres pg_isready`.
-5. En la primera ejecución del verificador, una variable local ocultaba el ID guardado y produjo un falso fallo de espera aunque el dato sí se había replicado: se corrigió el ámbito de la variable y se repitió la batería. Los reportes fallidos se conservan como historial real.
-6. Si un slot tarda en crearse con primario inactivo, se emiten snapshots WAL desde central. No se cambia el origen de la suscripción.
+La replicación es asíncrona y no ofrece una garantía de pérdida cero ante fallos del primario. No se implementan promoción ni failover automático. La autenticación utiliza SCRAM-SHA-256 en una red Docker local, sin TLS; el tráfico de replicación no está cifrado.
 
-Los logs de reinicio pueden mostrar cierre de conexiones, reconexiones o `the database system is shutting down`; K genera deliberadamente un error de escritura de solo lectura. En la última ejecución se observó también un `Connection refused` del apply worker mientras regional todavía arrancaba: PostgreSQL reconectó automáticamente, el UPDATE y DELETE posteriores se replicaron y los contadores apply/sync permanecieron en cero. Se debe distinguir esas entradas transitorias de errores persistentes. Consultar `RESULTADOS.md`, `evidencias/revision-final.txt` y `EVIDENCIAS.md`.
+La replicación lógica no sincroniza DDL ni secuencias. BI se utiliza para consultas; su secuencia SERIAL no sigue el valor del primario. Los cambios futuros de esquema requieren coordinación entre emisor y suscriptor.
 
-## Referencias técnicas oficiales
+`max_slot_wal_keep_size=1GB` limita el WAL retenido por slots al evaluarse los checkpoints; no representa un límite total de uso de disco. Una interrupción prolongada puede invalidar un slot. `hot_standby_feedback` protege información necesaria para decodificar, pero puede aumentar la acumulación de versiones de filas en el primario. El almacenamiento y los retrasos requieren supervisión.
 
-* [Decodificación en standby y snapshots WAL](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html)
-* [Parámetros de replicación](https://www.postgresql.org/docs/18/runtime-config-replication.html)
-* [Seguridad de replicación lógica](https://www.postgresql.org/docs/18/logical-replication-security.html)
-* [CREATE SUBSCRIPTION](https://www.postgresql.org/docs/18/sql-createsubscription.html)
-* [pg_basebackup](https://www.postgresql.org/docs/18/app-pgbasebackup.html)
-* [Vista de slots: restricciones de synced en hot standby](https://www.postgresql.org/docs/18/view-pg-replication-slots.html)
+Las pruebas eliminan sus registros temporales por ID y marcador. Un fallo parcial puede dejar registros `TEST_`; las secuencias avanzan entre ejecuciones. Las semillas no se vuelven a cargar sobre un volumen existente.
 
-## Archivos
+## Organización de la entrega
 
-`compose.yaml`, `.env.example`, `.gitignore`, `lab.ps1`; `config/` para parámetros y HBA por nodo; `sql/` para modelo y semillas; `scripts/` para inicialización, basebackup y suscripción; `evidencias/` para resultados reales, estados y logs. Las evidencias se conservan localmente e ignoran por defecto en Git para evitar publicar información operativa sin revisión. No se han realizado commits ni push.
+| Ruta | Contenido |
+|---|---|
+| [compose.yaml](compose.yaml) y [.env.example](.env.example) | Servicios, imagen, red, puertos, volúmenes y variables |
+| [lab.ps1](lab.ps1) | Arranque, pruebas, consultas y recopilación de registros |
+| config/ | Parámetros de PostgreSQL y HBA por nodo |
+| sql/ | Esquema, datos iniciales, roles y publicación |
+| scripts/ | Inicialización del primario, copia base y suscripción |
+| evidencias/ | Reportes de pruebas, estados y logs de ejecución |
+| [RESULTADOS.md](RESULTADOS.md) y [EVIDENCIAS.md](EVIDENCIAS.md) | Informe de validación e índice de respaldo |
+| [Evidencia_Uso_Lab.pdf](Evidencia_Uso_Lab.pdf) y [Evidencia_Uso_Lab.docx](Evidencia_Uso_Lab.docx) | Informe ilustrado y fuente editable |
+
+Los TXT de `evidencias/` están excluidos de Git por la configuración del proyecto, aunque forman parte de la entrega local. Una copia del repositorio por sí sola puede no contener los registros históricos; los comandos anteriores permiten generar nuevos reportes.
+
+## Referencias oficiales
+
+* PostgreSQL 18. [Decodificación lógica, slots en standby y snapshots WAL](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html).
+* PostgreSQL 18. [pg_basebackup y preparación del standby](https://www.postgresql.org/docs/18/app-pgbasebackup.html).
+* PostgreSQL 18. [Parámetros de replicación](https://www.postgresql.org/docs/18/runtime-config-replication.html).
+* PostgreSQL 18. [Seguridad de la replicación lógica](https://www.postgresql.org/docs/18/logical-replication-security.html).
+* PostgreSQL 18. [CREATE SUBSCRIPTION](https://www.postgresql.org/docs/18/sql-createsubscription.html).
+* PostgreSQL 18. [Vista pg_replication_slots](https://www.postgresql.org/docs/18/view-pg-replication-slots.html).
